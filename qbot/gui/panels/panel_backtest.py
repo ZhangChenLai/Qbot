@@ -16,10 +16,9 @@ import wx
 
 from qbot.common.file_utils import extract_content
 from qbot.common.logging.logger import LOGGER as logger
-from qbot.common.macros import strategy_choices
 from qbot.gui import gui_utils
+from qbot.gui.backtest_service import fetch_market_data, run_backtest, write_report
 from qbot.gui.config import DATA_DIR_BKT_RESULT
-from qbot.gui.elements.def_dialog import MessageDialog
 from qbot.gui.widgets.widget_web import WebPanel
 
 
@@ -65,6 +64,12 @@ class PanelBacktest(wx.Panel):
         self.M1S3_length = int(self.M1_length * 0.6)
 
         self.BackWebPanel = WebPanel(self)
+        self._loaded_bars = None
+        self._loaded_bars_key = None
+        self.BackWebPanel.show_html(
+            "<html><meta charset='utf-8'><body style='font-family: sans-serif; padding: 24px;'>"
+            "<h2>可视化股票/基金回测</h2><p>设置行情参数后点击“加载行情数据”，再选择策略并开始回测。</p></body></html>"
+        )
 
         # 第二层布局
         self.vbox_sizer_b = wx.BoxSizer(wx.VERTICAL)  # 纵向box
@@ -88,7 +93,7 @@ class PanelBacktest(wx.Panel):
         # 第一层布局
         self.HBoxPanelSizer = wx.BoxSizer(wx.HORIZONTAL)
         self.HBoxPanelSizer.Add(
-            self.vbox_sizer_b, proportion=0, border=2, flag=wx.EXPAND | wx.ALL
+            self.vbox_sizer_b, proportion=1, border=2, flag=wx.EXPAND | wx.ALL
         )
         self.SetSizer(self.HBoxPanelSizer)  # 使布局有效
 
@@ -210,13 +215,29 @@ class PanelBacktest(wx.Panel):
         logger.debug(f"select_code: {select_code}")
         self.backtest_opts["code"] = select_code
 
+        self.asset_type_box = wx.StaticBox(sub_panel, -1, "标的类型")
+        self.asset_type_sizer = wx.StaticBoxSizer(self.asset_type_box, wx.VERTICAL)
+        self.asset_type_cbox = wx.ComboBox(
+            sub_panel,
+            -1,
+            "A股/指数",
+            choices=["A股/指数", "开放式基金", "ETF"],
+            style=wx.CB_READONLY | wx.CB_DROPDOWN,
+        )
+        self.asset_type_sizer.Add(
+            self.asset_type_cbox,
+            proportion=0,
+            flag=wx.EXPAND | wx.ALL | wx.CENTER,
+            border=2,
+        )
+
         # 行情参数——股票周期选择
         self.stock_period_box = wx.StaticBox(sub_panel, -1, "股票周期")
         self.stock_period_sizer = wx.StaticBoxSizer(self.stock_period_box, wx.VERTICAL)
         self.stock_period_cbox = wx.ComboBox(
-            sub_panel, -1, "", choices=["30分钟", "60分钟", "日线", "周线"]
+            sub_panel, -1, "", choices=["日线", "周线"]
         )
-        self.stock_period_cbox.SetSelection(2)
+        self.stock_period_cbox.SetSelection(0)
         self.stock_period_sizer.Add(
             self.stock_period_cbox,
             proportion=0,
@@ -313,6 +334,12 @@ class PanelBacktest(wx.Panel):
             border=5,
         )
         stock_para_sizer.Add(
+            self.asset_type_sizer,
+            proportion=0,
+            flag=wx.EXPAND | wx.ALL | wx.CENTER,
+            border=5,
+        )
+        stock_para_sizer.Add(
             self.stock_period_sizer,
             proportion=0,
             flag=wx.EXPAND | wx.ALL | wx.CENTER,
@@ -359,10 +386,17 @@ class PanelBacktest(wx.Panel):
             sub_panel,
             -1,
             "",
-            choices=["沪深300指数(000300.SH)", "标普500指数(SPX)", "恒生指数(HSI)"],
+            choices=[
+                "沪深300指数(000300.SH)",
+                "上证指数(000001.SH)",
+                "深证成指(399001.SZ)",
+                "创业板指(399006.SZ)",
+            ],
         )
         self.stock_benchmark_cbox.SetSelection(0)
-        # self.stock_benchmark_cbox.Bind(wx.EVT_COMBOBOX, self._on_combobox_benchmarks_changed)  # noqa: E501
+        self.stock_benchmark_cbox.Bind(
+            wx.EVT_COMBOBOX, self._on_combobox_benchmarks_changed
+        )
         self.select_benchmark = self.stock_benchmark_cbox.GetValue()
         self.benchmark_code = extract_content(self.select_benchmark)[0]
         logger.debug(f"select_benchmark: {self.benchmark_code}")
@@ -453,7 +487,12 @@ class PanelBacktest(wx.Panel):
             sub_panel,
             -1,
             "",
-            choices=list(strategy_choices)[0],
+            choices=[
+                "单因子-相对强弱指数RSI",
+                "单因子-简单移动均线",
+                "单因子-布林线均值回归",
+                "单因子-MACD和ADX指标",
+            ],
             style=wx.CB_READONLY | wx.CB_DROPDOWN,
         )
         self.stock_strategy_cbox.SetSelection(0)
@@ -464,7 +503,9 @@ class PanelBacktest(wx.Panel):
             border=2,
         )
         # self.stock_strategy_cbox.Bind(wx.EVT_RADIOBUTTON, self._ev_src_choose)
-        # self.stock_strategy_cbox.Bind(wx.EVT_COMBOBOX, self._on_combobox_strategy_changed)
+        self.stock_strategy_cbox.Bind(
+            wx.EVT_COMBOBOX, self._on_combobox_strategy_changed
+        )
         select_strategy = self.stock_strategy_cbox.GetStringSelection()
         self.backtest_opts["select_strategy"] = select_strategy
         logger.debug(f"select_strategy: {select_strategy}")
@@ -605,13 +646,143 @@ class PanelBacktest(wx.Panel):
         pass
 
     def StartBacktest(self, event):
-        msg = "在线回测属于付费功能，请联系微信：Yida_Zhang2"
-        MessageDialog(msg)
-        print(msg)
-        pass
+        try:
+            options, config = self._read_backtest_inputs()
+            wx.BeginBusyCursor()
+            cache_key = self._market_data_key(options)
+            if self._loaded_bars is not None and self._loaded_bars_key == cache_key:
+                bars = self._loaded_bars.copy()
+            else:
+                bars = fetch_market_data(
+                    options["code"],
+                    options["start_time"],
+                    options["end_time"],
+                    period=options["period"],
+                    adjust=options["adjust"],
+                    asset_type=options["asset_type"],
+                )
+            benchmark = fetch_market_data(
+                options["benchmark"],
+                options["start_time"],
+                options["end_time"],
+                is_benchmark=True,
+                period=options["period"],
+            )
+            result = run_backtest(
+                bars,
+                benchmark,
+                strategy_name=options["select_strategy"],
+                initial_cash=config["init_cash"],
+                stake=config["stake"],
+                commission=config["commission"],
+                stamp_duty=config["stamp_duty"],
+                slippage_percent=config["slippage"],
+            )
+            report_path = write_report(
+                result,
+                DATA_DIR_BKT_RESULT.joinpath("bkt_result.html"),
+                code=options["code"],
+                benchmark_code=options["benchmark"],
+                strategy_name=options["select_strategy"],
+            )
+            self.BackWebPanel.show_file(report_path)
+            logger.info(
+                "回测完成: %s, 区间收益 %.2f%%",
+                options["code"],
+                result["total_return"] * 100,
+            )
+        except Exception as exc:
+            logger.exception("可视化回测失败")
+            wx.MessageBox(str(exc), "回测失败", wx.OK | wx.ICON_ERROR)
+        finally:
+            if wx.IsBusy():
+                wx.EndBusyCursor()
 
     def LoadData(self, event):
-        msg = "请联系微信：Yida_Zhang2 开通功能"
-        MessageDialog(msg)
-        print(msg)
-        pass
+        try:
+            options, _ = self._read_backtest_inputs()
+            wx.BeginBusyCursor()
+            bars = fetch_market_data(
+                options["code"],
+                options["start_time"],
+                options["end_time"],
+                period=options["period"],
+                adjust=options["adjust"],
+                asset_type=options["asset_type"],
+            )
+            self._loaded_bars = bars
+            self._loaded_bars_key = self._market_data_key(options)
+            cache_file = DATA_DIR_BKT_RESULT.joinpath("market_data.csv")
+            bars.to_csv(cache_file, encoding="utf-8-sig")
+            self.BackWebPanel.show_html(
+                "<html><meta charset='utf-8'><body style='font-family: sans-serif; padding: 24px;'>"
+                f"<h2>行情数据已加载</h2><p>标的：{options['code']}</p>"
+                f"<p>数据范围：{bars.index[0]:%Y-%m-%d} 至 {bars.index[-1]:%Y-%m-%d}，共 {len(bars)} 条。</p>"
+                f"<p>CSV 缓存：{cache_file.name}</p><p>切换到“回测参数”页并点击“开始回测”生成报告。</p></body></html>"
+            )
+            logger.info("已加载 %s 条行情数据: %s", len(bars), options["code"])
+        except Exception as exc:
+            logger.exception("加载回测行情失败")
+            wx.MessageBox(str(exc), "加载行情失败", wx.OK | wx.ICON_ERROR)
+        finally:
+            if wx.IsBusy():
+                wx.EndBusyCursor()
+
+    def _read_backtest_inputs(self):
+        start_time = gui_utils._wxdate2pydate(self.dpc_start_time.GetValue())
+        end_time = gui_utils._wxdate2pydate(self.dpc_end_time.GetValue())
+        if start_time is None or end_time is None:
+            raise ValueError("请选择有效的开始日期和结束日期。")
+        options = {
+            "start_time": start_time.strftime("%Y%m%d"),
+            "end_time": end_time.strftime("%Y%m%d"),
+            "code": self.stock_code_input.GetValue().strip(),
+            "benchmark": extract_content(
+                self.stock_benchmark_cbox.GetValue()
+            )[0],
+            "select_strategy": self.stock_strategy_cbox.GetStringSelection(),
+            "period": "weekly"
+            if self.stock_period_cbox.GetStringSelection() == "周线"
+            else "daily",
+            "adjust": {"前复权": "qfq", "后复权": "hfq", "不复权": ""}.get(
+                self.stock_authority_cbox.GetStringSelection(), "qfq"
+            ),
+            "asset_type": {
+                "A股/指数": "stock",
+                "开放式基金": "fund",
+                "ETF": "etf",
+            }.get(self.asset_type_cbox.GetStringSelection(), "stock"),
+        }
+        if options["start_time"] > options["end_time"]:
+            raise ValueError("开始日期不能晚于结束日期。")
+        if not options["code"] or not options["benchmark"]:
+            raise ValueError("请输入有效的回测标的和基准。")
+        self.backtest_opts.update(options)
+
+        try:
+            config = {
+                "init_cash": float(self.init_cash_input.GetValue()),
+                "stake": int(self.init_stake_input.GetValue()),
+                "slippage": float(self.init_slippage_input.GetValue()),
+                "commission": float(self.init_commission_input.GetValue()),
+                "stamp_duty": float(self.init_tax_input.GetValue()),
+            }
+        except ValueError as exc:
+            raise ValueError("资金、交易规模、滑点及费率必须填写为有效数字。") from exc
+        if config["init_cash"] <= 0 or config["stake"] <= 0:
+            raise ValueError("初始资金和交易规模必须大于 0。")
+        if min(config["slippage"], config["commission"], config["stamp_duty"]) < 0:
+            raise ValueError("滑点和费率不能为负数。")
+        self.backtest_config.update(config)
+        return options, config
+
+    @staticmethod
+    def _market_data_key(options):
+        return (
+            options["code"],
+            options["start_time"],
+            options["end_time"],
+            options["period"],
+            options["adjust"],
+            options["asset_type"],
+        )

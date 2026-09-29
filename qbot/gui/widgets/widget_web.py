@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import wx
 import wx.html2 as web
 
@@ -15,7 +17,14 @@ class WebPanel(wx.Panel):
         self.browser.LoadURL(url)
 
     def show_file(self, filename):
-        with open(filename, "r") as f:
-            html_cont = f.read()
-            self.browser.SetPage(html_cont, "")
-            self.browser.Show()
+        path = Path(filename)
+        if not path.is_file():
+            self.show_html(
+                "<html><meta charset='utf-8'><body>等待生成回测报告。</body></html>"
+            )
+            return
+        self.show_html(path.read_text(encoding="utf-8"), path.parent.as_uri() + "/")
+
+    def show_html(self, html_content, base_url=""):
+        self.browser.SetPage(html_content, base_url)
+        self.browser.Show()

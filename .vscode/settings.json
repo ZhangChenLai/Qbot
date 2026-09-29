@@ -66,5 +66,7 @@
         "--max-line-length=88"
     ],
     "typescript.preferences.importModuleSpecifier": "relative",
-    "debug.javascript.usePreview": false
+    "debug.javascript.usePreview": false,
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
